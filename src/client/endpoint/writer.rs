@@ -214,14 +214,17 @@ fn write_batch(
     Ok(())
 }
 
-fn write_frame(
+fn write_frame(writer: &mut impl io::Write, frame: &[u8], stopped: &AtomicBool) -> io::Result<()> {
+    write_frame_with_timeout(writer, frame, stopped, WRITE_TIMEOUT)
+}
+
+fn write_frame_with_timeout(
     writer: &mut impl io::Write,
     mut frame: &[u8],
     stopped: &AtomicBool,
+    timeout: Duration,
 ) -> io::Result<()> {
-    let deadline = Instant::now() + WRITE_TIMEOUT;
-    #[cfg(windows)]
-    let mut deadline = deadline;
+    let mut deadline = Instant::now() + timeout;
     while !frame.is_empty() && !stopped.load(Ordering::Acquire) {
         // Match interprocess's 512-byte pipe buffer hint: larger nonblocking Windows
         // writes can make no progress when the peer polls instead of blocking on read.
@@ -233,10 +236,7 @@ fn write_frame(
             Ok(0) => {}
             Ok(written) => {
                 frame = &frame[written..];
-                #[cfg(windows)]
-                {
-                    deadline = Instant::now() + WRITE_TIMEOUT;
-                }
+                deadline = Instant::now() + timeout;
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -432,6 +432,44 @@ mod tests {
         write_frame(&mut writer, b"first frame", &AtomicBool::new(false)).unwrap();
         write_frame(&mut writer, b"second frame", &AtomicBool::new(false)).unwrap();
         assert_eq!(writer.0, b"first framesecond frame");
+    }
+
+    #[test]
+    fn continued_progress_extends_the_write_deadline() {
+        struct SlowProgressWriter {
+            output: Vec<u8>,
+            progress_delay: Duration,
+            would_block: bool,
+        }
+        impl io::Write for SlowProgressWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.would_block {
+                    self.would_block = false;
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                let count = bytes.len().min(1);
+                self.output.extend_from_slice(&bytes[..count]);
+                std::thread::sleep(self.progress_delay);
+                self.would_block = true;
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = SlowProgressWriter {
+            output: Vec::new(),
+            progress_delay: Duration::from_millis(12),
+            would_block: false,
+        };
+        write_frame_with_timeout(
+            &mut writer,
+            b"slow progress",
+            &AtomicBool::new(false),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(writer.output, b"slow progress");
     }
 
     #[test]
